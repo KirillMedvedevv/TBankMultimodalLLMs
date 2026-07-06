@@ -13,25 +13,25 @@ Why yes/no instead of CLIP:
   construction, no negative-prompt hack needed.
 
 Supported backends (auto-detected from the model name, or force with backend=):
-  qwen     -> Qwen2-VL-2B / Qwen2.5-VL-3B   (same code, uses process_vision_info)
-  smolvlm  -> SmolVLM / SmolVLM2            (AutoModelForImageTextToText)
+  qwen     -> Qwen2-VL-2B / Qwen2.5-VL-3B / 7B   (same code, process_vision_info)
+  smolvlm  -> SmolVLM / SmolVLM2                 (AutoModelForImageTextToText)
 
-Convenience presets (any HF id also works directly):
-  "qwen2-2b", "qwen2.5-3b", "smolvlm2-2.2b", "smolvlm-500m", "smolvlm-256m"
+Big models on Kaggle (2 x T4, 16GB each):
+  7B fp16 (~16.6GB весов) в одну T4 не лезет — шардим на обе:
+    KaggleScorer("qwen2.5-7b", device_map="auto",
+                 max_memory={0: "13GiB", 1: "13GiB"})
+  либо 4-бит NF4 на ОДНОЙ T4 (~5.5GB, чуть шумнее логиты, ранжирование обычно ок):
+    KaggleScorer("qwen2.5-7b", load_4bit=True)      # pip install bitsandbytes
 
 Drop-in interface (same shape contract as SigLIPScorer / CLIPScorer):
-    scorer = KaggleScorer(model="qwen2-2b")          # or "smolvlm2-2.2b", ...
+    scorer = KaggleScorer(model="qwen2.5-3b")
     scorer.set_goal("the red agent is on the green goal square")
     scores = scorer.score(frames)                    # (N,3,64,64) in [-0.5,0.5] -> (N,)
-
-Sanity check / model comparison: run the __main__ block, e.g.
-    python kaggle_scorer.py qwen2-2b
-or in a cell call compare_models([...], goal_text) to score the same frames with
-several models back-to-back.
 
 Kaggle setup (once):
     !pip install -U "transformers>=4.50.0" accelerate
     !pip install -U qwen-vl-utils          # only needed for the qwen backend
+    !pip install -U bitsandbytes           # only for load_4bit=True
 """
 
 import inspect
@@ -39,9 +39,9 @@ import inspect
 import numpy as np
 import torch
 from PIL import Image
-from huggingface_hub import login
 
-
+# NB: токена здесь больше нет и быть не должно. Qwen публичный, login() не нужен.
+# Старый hf_... токен из этого файла — ОТОЗВАТЬ на huggingface.co/settings/tokens.
 
 try:
     from qwen_vl_utils import process_vision_info
@@ -52,6 +52,7 @@ except Exception:
 
 PRESETS = {
     "qwen2.5-3b": "Qwen/Qwen2.5-VL-3B-Instruct",
+    "qwen2.5-7b": "Qwen/Qwen2.5-VL-7B-Instruct",
 }
 
 
@@ -66,12 +67,18 @@ def _detect_backend(model_name):
 
 class KaggleScorer:
     def __init__(self, model="qwen2.5-3b", device=None, dtype=None,
-                 upscale=224, max_pixels=256 * 256, backend=None):
+                 upscale=448, max_pixels=512 * 512, backend=None,
+                 device_map=None, max_memory=None, load_4bit=False):
+        """device_map="auto" — шардинг весов по всем видимым GPU (для 7B на 2xT4).
+        max_memory={0:"13GiB",1:"13GiB"} — потолки на карту, оставляем запас
+        под активации. load_4bit=True — NF4-квантизация (одна GPU, bitsandbytes).
+        При шардинге .to(device) на модель звать нельзя — accelerate сам
+        раскладывает и гоняет активации между картами; входы кладём на cuda:0."""
         self.model_name = PRESETS.get(model, model)
         self.backend = backend or _detect_backend(self.model_name)
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         if dtype is None:
-            if self.device == "cuda":
+            if "cuda" in str(self.device):
                 dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
             else:
                 dtype = torch.float32
@@ -79,7 +86,7 @@ class KaggleScorer:
         self.upscale = upscale
 
         if self.backend == "qwen":
-            self._load_qwen(self.model_name, max_pixels)
+            self._load_qwen(self.model_name, max_pixels, device_map, max_memory, load_4bit)
         elif self.backend == "smolvlm":
             self._load_smolvlm(self.model_name)
         else:
@@ -104,13 +111,35 @@ class KaggleScorer:
         self._no_ids = self._token_ids(["No", "no", "NO", " No"])
 
     # ---------------- backend loading ----------------
-    def _load_qwen(self, model_name, max_pixels):
+    def _load_qwen(self, model_name, max_pixels, device_map, max_memory, load_4bit):
         from transformers import AutoProcessor
         if "2.5" in model_name or "2_5" in model_name:
             from transformers import Qwen2_5_VLForConditionalGeneration as Cls
         else:
             from transformers import Qwen2VLForConditionalGeneration as Cls
-        self.model = Cls.from_pretrained(model_name, torch_dtype=self.dtype).to(self.device).eval()
+
+        kw = dict(torch_dtype=self.dtype, low_cpu_mem_usage=True)
+        if load_4bit:
+            from transformers import BitsAndBytesConfig
+            kw["quantization_config"] = BitsAndBytesConfig(
+                load_in_4bit=True, bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=(torch.float16 if self.dtype == torch.float16
+                                        else torch.bfloat16))
+            kw["device_map"] = device_map or {"": 0}
+        elif device_map is not None:
+            kw["device_map"] = device_map
+            if max_memory is not None:
+                kw["max_memory"] = max_memory
+
+        if "device_map" in kw:
+            self.model = Cls.from_pretrained(model_name, **kw).eval()
+            self.device = "cuda:0"    # входы на первый шард, дальше accelerate сам
+            if hasattr(self.model, "hf_device_map"):
+                gpus = {v for v in self.model.hf_device_map.values()}
+                print(f"[scorer] шардинг по устройствам: {sorted(map(str, gpus))}")
+        else:
+            self.model = Cls.from_pretrained(model_name, **kw).to(self.device).eval()
+
         self.processor = AutoProcessor.from_pretrained(model_name, max_pixels=max_pixels)
 
     def _load_smolvlm(self, model_name):
@@ -218,7 +247,7 @@ def run_frame_test(scorer, goal_text, show_png=None):
     from env_tasks import MultiObjEnv          # поправь импорт если нужно
 
     scorer.set_goal(goal_text)
-    env = MultiObjEnv(size=8, render_mode="rgb_array", highlight=False)
+    env = MultiObjEnv(size=10, render_mode="rgb_array", highlight=False)
     env.reset(seed=0)
     gx, gy = env.goal_pos
 
@@ -276,17 +305,14 @@ if __name__ == "__main__":
     import sys
     MODEL = sys.argv[1] if len(sys.argv) > 1 else "qwen2.5-3b"
     GOALS = ["the red triangular agent is standing on the green goal square",
-             "the red triangular agent next to blue key",
-             "the red triangular agent next to blue door",]
+             "the red triangular agent next to yellow key",
+             "the red triangular agent next to blue door"]
 
     scorer = KaggleScorer(model=MODEL)
-    k=0
+    k = 0
     for i in GOALS:
-        k+=1
+        k += 1
         print("Test", k)
         print("backend:", scorer.backend, "| model:", scorer.model_name,
-          "| device:", scorer.device, "| dtype:", scorer.dtype, "| fwd_kw:", scorer._fwd_kw)
+              "| device:", scorer.device, "| dtype:", scorer.dtype, "| fwd_kw:", scorer._fwd_kw)
         run_frame_test(scorer, i, show_png=f"kaggle_scorer_test_{k}.png")
-
-    # compare several in one go (uncomment; loads/frees each in turn):
-    # compare_models(["qwen2-2b", "smolvlm2-2.2b", "smolvlm-500m"], GOAL)
